@@ -138,6 +138,29 @@ pub trait ProxyHttp {
         None
     }
 
+    /// Decide if the incoming request's condition _fails_ against the cached response.
+    ///
+    /// Returning `Ok(true)` means that the response does _not_ match against the condition, and
+    /// that the proxy can return `304 Not Modified` downstream.
+    ///
+    /// An example is a conditional GET request with `If-None-Match: "foobar"`. If the cached
+    /// response contains the `ETag: "foobar"`, then the condition fails, and `304 Not Modified`
+    /// should be returned. Else, the condition passes which means the full `200 OK` response must
+    /// be sent.
+    fn cache_not_modified_filter(
+        &self,
+        session: &Session,
+        resp: &ResponseHeader,
+        _ctx: &mut Self::CTX,
+    ) -> Result<bool> {
+        Ok(
+            pingora_core::protocols::http::conditional_filter::not_modified_filter(
+                session.req_header(),
+                resp,
+            ),
+        )
+    }
+
     /// Modify the request before it is sent to the upstream
     ///
     /// Unlike [Self::request_filter()], this filter allows to change the request headers to send
@@ -198,6 +221,16 @@ pub trait ProxyHttp {
     ) {
     }
 
+    /// Similar to [Self::upstream_response_filter()] but for response trailers
+    fn upstream_response_trailer_filter(
+        &self,
+        _session: &mut Session,
+        _upstream_trailers: &mut header::HeaderMap,
+        _ctx: &mut Self::CTX,
+    ) -> Result<()> {
+        Ok(())
+    }
+
     /// Similar to [Self::response_filter()] but for response body chunks
     fn response_body_filter(
         &self,
@@ -212,7 +245,11 @@ pub trait ProxyHttp {
         Ok(None)
     }
 
-    /// When a trailer is received.
+    /// Similar to [Self::response_filter()] but for response trailers.
+    /// Note, returning an Ok(Some(Bytes)) will result in the downstream response
+    /// trailers being written to the response body.
+    ///
+    /// TODO: make this interface more intuitive
     async fn response_trailer_filter(
         &self,
         _session: &mut Session,
@@ -362,5 +399,21 @@ pub trait ProxyHttp {
     /// - `false`: this request is a treated as a normal request
     fn is_purge(&self, _session: &Session, _ctx: &Self::CTX) -> bool {
         false
+    }
+
+    /// This filter is called after the proxy cache generates the downstream response to the purge
+    /// request (to invalidate or delete from the HTTP cache), based on the purge status, which
+    /// indicates whether the request succeeded or failed.
+    ///
+    /// The filter allows the user to modify or replace the generated downstream response.
+    /// If the filter returns `Err`, the proxy will instead send a 500 response.
+    fn purge_response_filter(
+        &self,
+        _session: &Session,
+        _ctx: &mut Self::CTX,
+        _purge_status: PurgeStatus,
+        _purge_response: &mut std::borrow::Cow<'static, ResponseHeader>,
+    ) -> Result<()> {
+        Ok(())
     }
 }

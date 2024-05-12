@@ -53,6 +53,8 @@ pub struct HttpSession {
     body_write_buf: BytesMut,
     /// Track how many application (not on the wire) body bytes already sent
     body_bytes_sent: usize,
+    /// Track how many application (not on the wire) body bytes already read
+    body_bytes_read: usize,
     /// Whether to update headers like connection, Date
     update_resp_headers: bool,
     /// timeouts:
@@ -61,7 +63,7 @@ pub struct HttpSession {
     write_timeout: Option<Duration>,
     /// A copy of the response that is already written to the client
     response_written: Option<Box<ResponseHeader>>,
-    /// The parse request header
+    /// The parsed request header
     request_header: Option<Box<RequestHeader>>,
     /// An internal buffer that holds a copy of the request body up to a certain size
     retry_buffer: Option<FixedBuffer>,
@@ -100,6 +102,7 @@ impl HttpSession {
             read_timeout: None,
             write_timeout: None,
             body_bytes_sent: 0,
+            body_bytes_read: 0,
             retry_buffer: None,
             upgraded: false,
             digest,
@@ -338,6 +341,7 @@ impl HttpSession {
         let read = self.read_body().await?;
         Ok(read.map(|b| {
             let bytes = Bytes::copy_from_slice(self.get_body(&b));
+            self.body_bytes_read += bytes.len();
             if let Some(buffer) = self.retry_buffer.as_mut() {
                 buffer.write_to_buffer(&bytes);
             }
@@ -627,9 +631,14 @@ impl HttpSession {
         Ok(res)
     }
 
-    /// Return how many (application, not wire) body bytes that have been written
+    /// Return how many response body bytes (application, not wire) already sent downstream
     pub fn body_bytes_sent(&self) -> usize {
         self.body_bytes_sent
+    }
+
+    /// Return how many request body bytes (application, not wire) already read from downstream
+    pub fn body_bytes_read(&self) -> usize {
+        self.body_bytes_read
     }
 
     fn is_chunked_encoding(&self) -> bool {
@@ -854,29 +863,31 @@ impl HttpSession {
     }
 
     async fn response_duplex(&mut self, task: HttpTask) -> Result<bool> {
-        match task {
+        let end_stream = match task {
             HttpTask::Header(header, end_stream) => {
                 self.write_response_header(header)
                     .await
                     .map_err(|e| e.into_down())?;
-                Ok(end_stream)
+                end_stream
             }
             HttpTask::Body(data, end_stream) => match data {
                 Some(d) => {
                     if !d.is_empty() {
                         self.write_body(&d).await.map_err(|e| e.into_down())?;
                     }
-                    Ok(end_stream)
+                    end_stream
                 }
-                None => Ok(end_stream),
+                None => end_stream,
             },
-            HttpTask::Trailer(_) => Ok(true), // h1 trailer is not supported yet
-            HttpTask::Done => {
-                self.finish_body().await.map_err(|e| e.into_down())?;
-                Ok(true)
-            }
-            HttpTask::Failed(e) => Err(e),
+            HttpTask::Trailer(_) => true, // h1 trailer is not supported yet
+            HttpTask::Done => true,
+            HttpTask::Failed(e) => return Err(e),
+        };
+        if end_stream {
+            // no-op if body wasn't initialized or is finished already
+            self.finish_body().await.map_err(|e| e.into_down())?;
         }
+        Ok(end_stream)
     }
 
     // TODO: use vectored write to avoid copying
@@ -905,12 +916,7 @@ impl HttpSession {
                     None => end_stream,
                 },
                 HttpTask::Trailer(_) => true, // h1 trailer is not supported yet
-                HttpTask::Done => {
-                    // flush body first
-                    self.write_body_buf().await.map_err(|e| e.into_down())?;
-                    self.finish_body().await.map_err(|e| e.into_down())?;
-                    return Ok(true);
-                }
+                HttpTask::Done => true,
                 HttpTask::Failed(e) => {
                     // flush the data we have and quit
                     self.write_body_buf().await.map_err(|e| e.into_down())?;
@@ -923,6 +929,10 @@ impl HttpSession {
             }
         }
         self.write_body_buf().await.map_err(|e| e.into_down())?;
+        if end_stream {
+            // no-op if body wasn't initialized or is finished already
+            self.finish_body().await.map_err(|e| e.into_down())?;
+        }
         Ok(end_stream)
     }
 }
@@ -1013,7 +1023,7 @@ fn http_resp_header_to_buf(
     let status = resp.status;
     buf.put_slice(status.as_str().as_bytes());
     buf.put_u8(b' ');
-    let reason = status.canonical_reason();
+    let reason = resp.get_reason_phrase();
     if let Some(reason_buf) = reason {
         buf.put_slice(reason_buf.as_bytes());
     }
@@ -1097,10 +1107,10 @@ mod tests_stream {
             .build();
         let mut http_stream = HttpSession::new(Box::new(mock_io));
         http_stream.read_request().await.unwrap();
-        let res = http_stream.read_body().await.unwrap().unwrap();
-        assert_eq!(res, BufRef::new(0, 3));
+        let res = http_stream.read_body_bytes().await.unwrap().unwrap();
+        assert_eq!(res, input3.as_slice());
         assert_eq!(http_stream.body_reader.body_state, ParseState::Complete(3));
-        assert_eq!(input3, http_stream.get_body(&res));
+        assert_eq!(http_stream.body_bytes_read(), 3);
     }
 
     #[tokio::test]
@@ -1119,7 +1129,8 @@ mod tests_stream {
         let mut http_stream = HttpSession::new(Box::new(mock_io));
         http_stream.read_timeout = Some(Duration::from_secs(1));
         http_stream.read_request().await.unwrap();
-        let res = http_stream.read_body().await;
+        let res = http_stream.read_body_bytes().await;
+        assert_eq!(http_stream.body_bytes_read(), 0);
         assert_eq!(res.unwrap_err().etype(), &ReadTimedout);
     }
 
@@ -1131,10 +1142,10 @@ mod tests_stream {
         let mock_io = Builder::new().read(&input1[..]).read(&input2[..]).build();
         let mut http_stream = HttpSession::new(Box::new(mock_io));
         http_stream.read_request().await.unwrap();
-        let res = http_stream.read_body().await.unwrap().unwrap();
-        assert_eq!(res, BufRef::new(0, 3));
+        let res = http_stream.read_body_bytes().await.unwrap().unwrap();
+        assert_eq!(res, b"abc".as_slice());
         assert_eq!(http_stream.body_reader.body_state, ParseState::Complete(3));
-        assert_eq!(b"abc", http_stream.get_body(&res));
+        assert_eq!(http_stream.body_bytes_read(), 3);
     }
 
     #[tokio::test]
@@ -1152,13 +1163,14 @@ mod tests_stream {
             .build();
         let mut http_stream = HttpSession::new(Box::new(mock_io));
         http_stream.read_request().await.unwrap();
-        let res = http_stream.read_body().await.unwrap().unwrap();
-        assert_eq!(res, BufRef::new(0, 1));
+        let res = http_stream.read_body_bytes().await.unwrap().unwrap();
+        assert_eq!(res, input3.as_slice());
         assert_eq!(http_stream.body_reader.body_state, ParseState::HTTP1_0(1));
-        assert_eq!(input3, http_stream.get_body(&res));
-        let res = http_stream.read_body().await.unwrap();
-        assert_eq!(res, None);
+        assert_eq!(http_stream.body_bytes_read(), 1);
+        let res = http_stream.read_body_bytes().await.unwrap();
+        assert!(res.is_none());
         assert_eq!(http_stream.body_reader.body_state, ParseState::Complete(1));
+        assert_eq!(http_stream.body_bytes_read(), 1);
     }
 
     #[tokio::test]
@@ -1176,16 +1188,15 @@ mod tests_stream {
             .build();
         let mut http_stream = HttpSession::new(Box::new(mock_io));
         http_stream.read_request().await.unwrap();
-        let res = http_stream.read_body().await.unwrap().unwrap();
-        assert_eq!(res, BufRef::new(0, 1));
+        let res = http_stream.read_body_bytes().await.unwrap().unwrap();
+        assert_eq!(res, b"a".as_slice());
         assert_eq!(http_stream.body_reader.body_state, ParseState::HTTP1_0(1));
-        assert_eq!(b"a", http_stream.get_body(&res));
-        let res = http_stream.read_body().await.unwrap().unwrap();
-        assert_eq!(res, BufRef::new(0, 1));
+        let res = http_stream.read_body_bytes().await.unwrap().unwrap();
+        assert_eq!(res, b"b".as_slice());
         assert_eq!(http_stream.body_reader.body_state, ParseState::HTTP1_0(2));
-        assert_eq!(input3, http_stream.get_body(&res));
-        let res = http_stream.read_body().await.unwrap();
-        assert_eq!(res, None);
+        let res = http_stream.read_body_bytes().await.unwrap();
+        assert_eq!(http_stream.body_bytes_read(), 2);
+        assert!(res.is_none());
         assert_eq!(http_stream.body_reader.body_state, ParseState::Complete(2));
     }
 
@@ -1197,8 +1208,9 @@ mod tests_stream {
         let mock_io = Builder::new().read(&input1[..]).read(&input2[..]).build();
         let mut http_stream = HttpSession::new(Box::new(mock_io));
         http_stream.read_request().await.unwrap();
-        let res = http_stream.read_body().await.unwrap();
-        assert_eq!(res, None);
+        let res = http_stream.read_body_bytes().await.unwrap();
+        assert!(res.is_none());
+        assert_eq!(http_stream.body_bytes_read(), 0);
         assert_eq!(http_stream.body_reader.body_state, ParseState::Complete(0));
     }
 
@@ -1216,8 +1228,9 @@ mod tests_stream {
         let mut http_stream = HttpSession::new(Box::new(mock_io));
         http_stream.read_request().await.unwrap();
         assert!(http_stream.is_chunked_encoding());
-        let res = http_stream.read_body().await.unwrap();
-        assert_eq!(res, None);
+        let res = http_stream.read_body_bytes().await.unwrap();
+        assert!(res.is_none());
+        assert_eq!(http_stream.body_bytes_read(), 0);
         assert_eq!(http_stream.body_reader.body_state, ParseState::Complete(0));
     }
 
@@ -1235,14 +1248,15 @@ mod tests_stream {
         let mut http_stream = HttpSession::new(Box::new(mock_io));
         http_stream.read_request().await.unwrap();
         assert!(http_stream.is_chunked_encoding());
-        let res = http_stream.read_body().await.unwrap().unwrap();
-        assert_eq!(res, BufRef::new(3, 1));
+        let res = http_stream.read_body_bytes().await.unwrap().unwrap();
+        assert_eq!(res, b"a".as_slice());
         assert_eq!(
             http_stream.body_reader.body_state,
             ParseState::Chunked(1, 0, 0, 0)
         );
-        let res = http_stream.read_body().await.unwrap();
-        assert_eq!(res, None);
+        let res = http_stream.read_body_bytes().await.unwrap();
+        assert!(res.is_none());
+        assert_eq!(http_stream.body_bytes_read(), 1);
         assert_eq!(http_stream.body_reader.body_state, ParseState::Complete(1));
     }
 
@@ -1369,6 +1383,21 @@ mod tests_stream {
         let mock_io = Builder::new().write(wire).build();
         let mut http_stream = HttpSession::new(Box::new(mock_io));
         let mut new_response = ResponseHeader::build(StatusCode::OK, None).unwrap();
+        new_response.append_header("Foo", "Bar").unwrap();
+        http_stream.update_resp_headers = false;
+        http_stream
+            .write_response_header_ref(&new_response)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn write_custom_reason() {
+        let wire = b"HTTP/1.1 200 Just Fine\r\nFoo: Bar\r\n\r\n";
+        let mock_io = Builder::new().write(wire).build();
+        let mut http_stream = HttpSession::new(Box::new(mock_io));
+        let mut new_response = ResponseHeader::build(StatusCode::OK, None).unwrap();
+        new_response.set_reason_phrase(Some("Just Fine")).unwrap();
         new_response.append_header("Foo", "Bar").unwrap();
         http_stream.update_resp_headers = false;
         http_stream

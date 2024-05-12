@@ -79,6 +79,7 @@ mod subrequest;
 
 use subrequest::Ctx as SubReqCtx;
 
+pub use proxy_purge::PurgeStatus;
 pub use proxy_trait::ProxyHttp;
 
 pub mod prelude {
@@ -222,7 +223,12 @@ impl<SV> HttpProxy<SV> {
         }
     }
 
-    fn upstream_filter(&self, session: &mut Session, task: &mut HttpTask, ctx: &mut SV::CTX)
+    fn upstream_filter(
+        &self,
+        session: &mut Session,
+        task: &mut HttpTask,
+        ctx: &mut SV::CTX,
+    ) -> Result<()>
     where
         SV: ProxyHttp,
     {
@@ -233,10 +239,14 @@ impl<SV> HttpProxy<SV> {
             HttpTask::Body(data, eos) => self
                 .inner
                 .upstream_response_body_filter(session, data, *eos, ctx),
+            HttpTask::Trailer(Some(trailers)) => self
+                .inner
+                .upstream_response_trailer_filter(session, trailers, ctx)?,
             _ => {
-                // TODO: add other upstream filter traits
+                // task does not support a filter
             }
         }
+        Ok(())
     }
 
     async fn finish(
@@ -605,7 +615,7 @@ where
         self.process_request(session, ctx).await
     }
 
-    fn http_cleanup(&self) {
+    async fn http_cleanup(&self) {
         // Notify all keepalived requests blocking on read_request() to abort
         self.shutdown.notify_waiters();
 
@@ -625,4 +635,15 @@ pub fn http_proxy_service<SV>(conf: &Arc<ServerConf>, inner: SV) -> Service<Http
         "Pingora HTTP Proxy Service".into(),
         HttpProxy::new(inner, conf.clone()),
     )
+}
+
+/// Create a [Service] from the user implemented [ProxyHttp].
+///
+/// The returned [Service] can be hosted by a [pingora_core::server::Server] directly.
+pub fn http_proxy_service_with_name<SV>(
+    conf: &Arc<ServerConf>,
+    inner: SV,
+    name: &str,
+) -> Service<HttpProxy<SV>> {
+    Service::new(name.to_string(), HttpProxy::new(inner, conf.clone()))
 }

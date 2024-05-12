@@ -121,6 +121,21 @@ impl Connector {
 
                 builder.set_private_key_file(key, SslFiletype::PEM).unwrap();
             }
+            if conf.debug_ssl_keylog {
+                // write TLS keys to file specified by SSLKEYLOGFILE if it exists
+                if let Some(keylog) = std::env::var_os("SSLKEYLOGFILE").and_then(|path| {
+                    std::fs::OpenOptions::new()
+                        .append(true)
+                        .create(true)
+                        .open(path)
+                        .ok()
+                }) {
+                    use std::io::Write;
+                    builder.set_keylog_callback(move |_, line| {
+                        let _ = writeln!(&keylog, "{}", line);
+                    });
+                }
+            }
         } else {
             init_ssl_cert_env_vars();
             builder.set_default_verify_paths().unwrap();
@@ -147,8 +162,7 @@ impl Connector {
 */
 fn replace_leftmost_underscore(sni: &str) -> Option<String> {
     // wildcard is only leftmost label
-    let mut s = sni.splitn(2, '.');
-    if let (Some(leftmost), Some(rest)) = (s.next(), s.next()) {
+    if let Some((leftmost, rest)) = sni.split_once('.') {
         // if not a subdomain or leftmost does not contain underscore return
         if !rest.contains('.') || !leftmost.contains('_') {
             return None;

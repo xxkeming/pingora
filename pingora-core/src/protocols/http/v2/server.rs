@@ -20,7 +20,7 @@ use h2::server;
 use h2::server::SendResponse;
 use h2::{RecvStream, SendStream};
 use http::header::HeaderName;
-use http::{header, Response};
+use http::{header, HeaderMap, Response};
 use log::{debug, warn};
 use pingora_http::{RequestHeader, ResponseHeader};
 use std::sync::Arc;
@@ -90,9 +90,9 @@ pub struct HttpSession {
     // Indicate that whether a END_STREAM is already sent
     // in order to tell whether needs to send one extra FRAME when this response finishes
     ended: bool,
-    // How many request body bytes have been read so far.
+    // How many (application, not wire) request body bytes have been read so far.
     body_read: usize,
-    // How many response body bytes have been sent so far.
+    // How many (application, not wire) response body bytes have been sent so far.
     body_sent: usize,
     // buffered request body for retry logic
     retry_buffer: Option<FixedBuffer>,
@@ -256,6 +256,27 @@ impl HttpSession {
         Ok(())
     }
 
+    /// Write response trailers to the client, this also closes the stream.
+    pub fn write_trailers(&mut self, trailers: HeaderMap) -> Result<()> {
+        if self.ended {
+            warn!("Tried to write trailers after end of stream, dropping them");
+            return Ok(());
+        }
+        let Some(writer) = self.send_response_body.as_mut() else {
+            return Err(Error::explain(
+                ErrorType::H2Error,
+                "try to send trailers before header is sent",
+            ));
+        };
+        writer.send_trailers(trailers).or_err(
+            ErrorType::WriteError,
+            "while writing h2 response trailers to downstream",
+        )?;
+        // sending trailers closes the stream
+        self.ended = true;
+        Ok(())
+    }
+
     /// Similar to [Self::write_response_header], this function takes a reference instead
     pub fn write_response_header_ref(&mut self, header: &ResponseHeader, end: bool) -> Result<()> {
         self.write_response_header(Box::new(header.clone()), end)
@@ -305,15 +326,20 @@ impl HttpSession {
                     }
                     None => end,
                 },
-                HttpTask::Trailer(_) => true, // trailer is not supported yet
-                HttpTask::Done => {
-                    self.finish().map_err(|e| e.into_down())?;
-                    return Ok(true);
+                HttpTask::Trailer(Some(trailers)) => {
+                    self.write_trailers(*trailers)?;
+                    true
                 }
+                HttpTask::Trailer(None) => true,
+                HttpTask::Done => true,
                 HttpTask::Failed(e) => {
                     return Err(e);
                 }
             } || end_stream // safe guard in case `end` in tasks flips from true to false
+        }
+        if end_stream {
+            // no-op if finished already
+            self.finish().map_err(|e| e.into_down())?;
         }
         Ok(end_stream)
     }
@@ -422,9 +448,14 @@ impl HttpSession {
         }
     }
 
-    /// How many response body bytes sent to the client
+    /// Return how many response body bytes (application, not wire) already sent downstream
     pub fn body_bytes_sent(&self) -> usize {
         self.body_sent
+    }
+
+    /// Return how many request body bytes (application, not wire) already read from downstream
+    pub fn body_bytes_read(&self) -> usize {
+        self.body_read
     }
 
     /// Return the [Digest] of the connection.
@@ -446,7 +477,7 @@ impl HttpSession {
 #[cfg(test)]
 mod test {
     use super::*;
-    use http::{Method, Request};
+    use http::{HeaderValue, Method, Request};
     use tokio::io::duplex;
 
     #[tokio::test]
@@ -454,6 +485,10 @@ mod test {
         let (client, server) = duplex(65536);
         let client_body = "test client body";
         let server_body = "test server body";
+
+        let mut expected_trailers = HeaderMap::new();
+        expected_trailers.insert("test", HeaderValue::from_static("trailers"));
+        let trailers = expected_trailers.clone();
 
         tokio::spawn(async move {
             let (h2, connection) = h2::client::handshake(client).await.unwrap();
@@ -477,6 +512,8 @@ mod test {
             assert_eq!(head.status, 200);
             let data = body.data().await.unwrap().unwrap();
             assert_eq!(data, server_body);
+            let resp_trailers = body.trailers().await.unwrap().unwrap();
+            assert_eq!(resp_trailers, expected_trailers);
         });
 
         let mut connection = handshake(Box::new(server), None).await.unwrap();
@@ -486,6 +523,7 @@ mod test {
             .await
             .unwrap()
         {
+            let trailers = trailers.clone();
             tokio::spawn(async move {
                 let req = http.req_header();
                 assert_eq!(req.method, Method::GET);
@@ -499,6 +537,7 @@ mod test {
                 let body = http.read_body_or_idle(false).await.unwrap().unwrap();
                 assert_eq!(body, client_body);
                 assert!(http.is_body_done());
+                assert_eq!(http.body_bytes_read(), 16);
 
                 let retry_body = http.get_retry_buffer().unwrap();
                 assert_eq!(retry_body, client_body);
@@ -520,7 +559,9 @@ mod test {
 
                 // end: false here to verify finish() closes the stream nicely
                 http.write_body(server_body.into(), false).unwrap();
+                assert_eq!(http.body_bytes_sent(), 16);
 
+                http.write_trailers(trailers).unwrap();
                 http.finish().unwrap();
             });
         }
