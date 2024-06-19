@@ -19,7 +19,7 @@ use std::net::SocketAddr as InetSocketAddr;
 use std::os::unix::io::AsRawFd;
 
 use crate::protocols::l4::ext::{
-    connect as tcp_connect, connect_uds, set_recv_buf, set_tcp_keepalive,
+    connect_uds, connect_with as tcp_connect, set_recv_buf, set_tcp_fastopen_connect,
 };
 use crate::protocols::l4::socket::SocketAddr;
 use crate::protocols::l4::stream::Stream;
@@ -39,7 +39,16 @@ where
     let peer_addr = peer.address();
     let mut stream: Stream = match peer_addr {
         SocketAddr::Inet(addr) => {
-            let connect_future = tcp_connect(addr, bind_to.as_ref());
+            let connect_future = tcp_connect(addr, bind_to.as_ref(), |socket| {
+                if peer.tcp_fast_open() {
+                    set_tcp_fastopen_connect(socket.as_raw_fd())?;
+                }
+                if let Some(recv_buf) = peer.tcp_recv_buf() {
+                    debug!("Setting recv buf size");
+                    set_recv_buf(socket.as_raw_fd(), recv_buf)?;
+                }
+                Ok(())
+            });
             let conn_res = match peer.connection_timeout() {
                 Some(t) => pingora_timeout::timeout(t, connect_future)
                     .await
@@ -51,14 +60,6 @@ where
             match conn_res {
                 Ok(socket) => {
                     debug!("connected to new server: {}", peer.address());
-                    if let Some(ka) = peer.tcp_keepalive() {
-                        debug!("Setting tcp keepalive");
-                        set_tcp_keepalive(&socket, ka)?;
-                    }
-                    if let Some(recv_buf) = peer.tcp_recv_buf() {
-                        debug!("Setting recv buf size");
-                        set_recv_buf(socket.as_raw_fd(), recv_buf)?;
-                    }
                     Ok(socket.into())
                 }
                 Err(e) => {
@@ -86,7 +87,6 @@ where
             match conn_res {
                 Ok(socket) => {
                     debug!("connected to new server: {}", peer.address());
-                    // no SO_KEEPALIVE for UDS
                     Ok(socket.into())
                 }
                 Err(e) => {
@@ -105,6 +105,10 @@ where
         stream.tracer = Some(t);
     }
 
+    // settings applied based on stream type
+    if let Some(ka) = peer.tcp_keepalive() {
+        stream.set_keepalive(ka)?;
+    }
     stream.set_nodelay()?;
 
     let digest = SocketDigest::from_raw_fd(stream.as_raw_fd());

@@ -15,10 +15,11 @@
 //! Extra information about the connection
 
 use std::sync::Arc;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use once_cell::sync::OnceCell;
 
+use super::l4::ext::{get_recv_buf, get_tcp_info, TCP_INFO};
 use super::l4::socket::SocketAddr;
 use super::raw_connect::ProxyDigest;
 use super::ssl::digest::SslDigest;
@@ -88,12 +89,38 @@ impl SocketDigest {
             .get_or_init(|| SocketAddr::from_raw_fd(self.raw_fd, false))
             .as_ref()
     }
+
+    fn is_inet(&self) -> bool {
+        self.local_addr().and_then(|p| p.as_inet()).is_some()
+    }
+
+    pub fn tcp_info(&self) -> Option<TCP_INFO> {
+        if self.is_inet() {
+            get_tcp_info(self.raw_fd).ok()
+        } else {
+            None
+        }
+    }
+
+    pub fn get_recv_buf(&self) -> Option<usize> {
+        if self.is_inet() {
+            get_recv_buf(self.raw_fd).ok()
+        } else {
+            None
+        }
+    }
 }
 
 /// The interface to return timing information
 pub trait GetTimingDigest {
     /// Return the timing for each layer from the lowest layer to upper
     fn get_timing_digest(&self) -> Vec<Option<TimingDigest>>;
+    fn get_read_pending_time(&self) -> Duration {
+        Duration::ZERO
+    }
+    fn get_write_pending_time(&self) -> Duration {
+        Duration::ZERO
+    }
 }
 
 /// The interface to set or return proxy information

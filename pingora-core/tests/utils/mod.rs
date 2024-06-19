@@ -15,17 +15,16 @@
 use once_cell::sync::Lazy;
 use std::{thread, time};
 
+use clap::Parser;
 use pingora_core::listeners::Listeners;
 use pingora_core::server::configuration::Opt;
 use pingora_core::server::Server;
 use pingora_core::services::listening::Service;
-use structopt::StructOpt;
 
 use async_trait::async_trait;
 use bytes::Bytes;
 use http::{Response, StatusCode};
 use pingora_timeout::timeout;
-use std::sync::Arc;
 use std::time::Duration;
 
 use pingora_core::apps::http_app::ServeHttp;
@@ -63,10 +62,6 @@ impl ServeHttp for EchoApp {
     }
 }
 
-pub fn new_http_echo_app() -> Arc<EchoApp> {
-    Arc::new(EchoApp {})
-}
-
 pub struct MyServer {
     pub handle: thread::JoinHandle<()>,
 }
@@ -88,11 +83,8 @@ fn entry_point(opt: Option<Opt>) {
     tls_settings.enable_h2();
     listeners.add_tls_with_settings("0.0.0.0:6146", None, tls_settings);
 
-    let echo_service_http = Service::with_listeners(
-        "Echo Service HTTP".to_string(),
-        listeners,
-        new_http_echo_app(),
-    );
+    let echo_service_http =
+        Service::with_listeners("Echo Service HTTP".to_string(), listeners, EchoApp);
 
     my_server.add_service(echo_service_http);
     my_server.run_forever();
@@ -106,7 +98,7 @@ impl MyServer {
             "tests/pingora_conf.yaml".into(),
         ];
         let server_handle = thread::spawn(|| {
-            entry_point(Some(Opt::from_iter(opts)));
+            entry_point(Some(Opt::parse_from(opts)));
         });
         // wait until the server is up
         thread::sleep(time::Duration::from_secs(2));

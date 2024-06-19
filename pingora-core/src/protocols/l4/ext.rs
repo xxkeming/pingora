@@ -56,13 +56,12 @@ pub struct TCP_INFO {
     tcpi_rcv_ssthresh: u32,
     pub tcpi_rtt: u32,
     tcpi_rttvar: u32,
-    /* uncomment these field if needed
     tcpi_snd_ssthresh: u32,
     tcpi_snd_cwnd: u32,
     tcpi_advmss: u32,
     tcpi_reordering: u32,
     tcpi_rcv_rtt: u32,
-    tcpi_rcv_space: u32,
+    pub tcpi_rcv_space: u32,
     tcpi_total_retrans: u32,
     tcpi_pacing_rate: u64,
     tcpi_max_pacing_rate: u64,
@@ -75,8 +74,19 @@ pub struct TCP_INFO {
     tcpi_data_segs_in: u32,
     tcpi_data_segs_out: u32,
     tcpi_delivery_rate: u64,
-    */
-    /* and more, see include/linux/tcp.h */
+    tcpi_busy_time: u64,
+    tcpi_rwnd_limited: u64,
+    tcpi_sndbuf_limited: u64,
+    tcpi_delivered: u32,
+    tcpi_delivered_ce: u32,
+    tcpi_bytes_sent: u64,
+    tcpi_bytes_retrans: u64,
+    tcpi_dsack_dups: u32,
+    tcpi_reord_seen: u32,
+    tcpi_rcv_ooopack: u32,
+    tcpi_snd_wnd: u32,
+    pub tcpi_rcv_wnd: u32,
+    // and more, see include/linux/tcp.h
 }
 
 impl TCP_INFO {
@@ -223,16 +233,64 @@ pub fn set_recv_buf(_fd: RawFd, _: usize) -> Result<()> {
     Ok(())
 }
 
-/*
- * this extension is needed until the following are addressed
- * https://github.com/tokio-rs/tokio/issues/1543
- * https://github.com/tokio-rs/mio/issues/1257
- * https://github.com/tokio-rs/mio/issues/1211
- */
-/// connect() to the given address while optionally bind to the specific source address
+#[cfg(target_os = "linux")]
+pub fn get_recv_buf(fd: RawFd) -> io::Result<usize> {
+    let mut recv_size: c_int = 0;
+    let mut size = std::mem::size_of::<c_int>() as u32;
+    get_opt(
+        fd,
+        libc::SOL_SOCKET,
+        libc::SO_RCVBUF,
+        &mut recv_size,
+        &mut size,
+    )?;
+    Ok(recv_size as usize)
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn get_recv_buf(_fd: RawFd) -> Result<usize> {
+    Ok(0)
+}
+
+/// Enable client side TCP fast open.
+#[cfg(target_os = "linux")]
+pub fn set_tcp_fastopen_connect(fd: RawFd) -> Result<()> {
+    set_opt(
+        fd,
+        libc::IPPROTO_TCP,
+        libc::TCP_FASTOPEN_CONNECT,
+        1 as c_int,
+    )
+    .or_err(ConnectError, "failed to set TCP_FASTOPEN_CONNECT")
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn set_tcp_fastopen_connect(_fd: RawFd) -> Result<()> {
+    Ok(())
+}
+
+/// Enable server side TCP fast open.
+#[cfg(target_os = "linux")]
+pub fn set_tcp_fastopen_backlog(fd: RawFd, backlog: usize) -> Result<()> {
+    set_opt(fd, libc::IPPROTO_TCP, libc::TCP_FASTOPEN, backlog as c_int)
+        .or_err(ConnectError, "failed to set TCP_FASTOPEN")
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn set_tcp_fastopen_backlog(_fd: RawFd, _backlog: usize) -> Result<()> {
+    Ok(())
+}
+
+/// connect() to the given address while optionally binding to the specific source address.
+///
+/// The `set_socket` callback can be used to tune the socket before `connect()` is called.
 ///
 /// `IP_BIND_ADDRESS_NO_PORT` is used.
-pub async fn connect(addr: &SocketAddr, bind_to: Option<&SocketAddr>) -> Result<TcpStream> {
+pub(crate) async fn connect_with<F: FnOnce(&TcpSocket) -> Result<()>>(
+    addr: &SocketAddr,
+    bind_to: Option<&SocketAddr>,
+    set_socket: F,
+) -> Result<TcpStream> {
     let socket = if addr.is_ipv4() {
         TcpSocket::new_v4()
     } else {
@@ -252,10 +310,19 @@ pub async fn connect(addr: &SocketAddr, bind_to: Option<&SocketAddr>) -> Result<
     }
     // TODO: add support for bind on other platforms
 
+    set_socket(&socket)?;
+
     socket
         .connect(*addr)
         .await
         .map_err(|e| wrap_os_connect_error(e, format!("Fail to connect to {}", *addr)))
+}
+
+/// connect() to the given address while optionally binding to the specific source address.
+///
+/// `IP_BIND_ADDRESS_NO_PORT` is used.
+pub async fn connect(addr: &SocketAddr, bind_to: Option<&SocketAddr>) -> Result<TcpStream> {
+    connect_with(addr, bind_to, |_| Ok(())).await
 }
 
 /// connect() to the given Unix domain socket
@@ -320,18 +387,33 @@ mod test {
 
         #[cfg(target_os = "linux")]
         {
-            let mut recv_size: c_int = 0;
-            let mut size = std::mem::size_of::<c_int>() as u32;
-            get_opt(
-                socket.as_raw_fd(),
-                libc::SOL_SOCKET,
-                libc::SO_RCVBUF,
-                &mut recv_size,
-                &mut size,
-            )
-            .unwrap();
             // kernel doubles whatever is set
-            assert_eq!(recv_size, 102400 * 2);
+            assert_eq!(get_recv_buf(socket.as_raw_fd()).unwrap(), 102400 * 2);
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[ignore] // this test requires the Linux system to have net.ipv4.tcp_fastopen set
+    #[tokio::test]
+    async fn test_set_fast_open() {
+        use std::time::Instant;
+
+        // connect once to make sure their is a SYN cookie to use for TFO
+        connect_with(&"1.1.1.1:80".parse().unwrap(), None, |socket| {
+            set_tcp_fastopen_connect(socket.as_raw_fd())
+        })
+        .await
+        .unwrap();
+
+        let start = Instant::now();
+        connect_with(&"1.1.1.1:80".parse().unwrap(), None, |socket| {
+            set_tcp_fastopen_connect(socket.as_raw_fd())
+        })
+        .await
+        .unwrap();
+        let connection_time = start.elapsed();
+
+        // connect() return right away as the SYN goes out only when the first write() is called.
+        assert!(connection_time.as_millis() < 4);
     }
 }

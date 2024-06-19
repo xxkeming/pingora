@@ -22,10 +22,11 @@ use std::os::unix::io::AsRawFd;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
-use std::time::SystemTime;
+use std::time::{Duration, Instant, SystemTime};
 use tokio::io::{self, AsyncRead, AsyncWrite, AsyncWriteExt, BufStream, ReadBuf};
 use tokio::net::{TcpStream, UnixStream};
 
+use crate::protocols::l4::ext::{set_tcp_keepalive, TcpKeepalive};
 use crate::protocols::raw_connect::ProxyDigest;
 use crate::protocols::{
     GetProxyDigest, GetSocketDigest, GetTimingDigest, Shutdown, SocketDigest, Ssl, TimingDigest,
@@ -140,6 +141,8 @@ pub struct Stream {
     pub established_ts: SystemTime,
     /// The distributed tracing object for this stream
     pub tracer: Option<Tracer>,
+    read_pending_time: AccumulatedDuration,
+    write_pending_time: AccumulatedDuration,
 }
 
 impl Stream {
@@ -148,6 +151,15 @@ impl Stream {
         if let RawStream::Tcp(s) = &self.stream.get_ref() {
             s.set_nodelay(true)
                 .or_err(ConnectError, "failed to set_nodelay")?;
+        }
+        Ok(())
+    }
+
+    /// set TCP keepalive settings for this connection if `self` is TCP
+    pub fn set_keepalive(&mut self, ka: &TcpKeepalive) -> Result<()> {
+        if let RawStream::Tcp(s) = &self.stream.get_ref() {
+            debug!("Setting tcp keepalive");
+            set_tcp_keepalive(s, ka)?;
         }
         Ok(())
     }
@@ -162,6 +174,8 @@ impl From<TcpStream> for Stream {
             proxy_digest: None,
             socket_digest: None,
             tracer: None,
+            read_pending_time: AccumulatedDuration::new(),
+            write_pending_time: AccumulatedDuration::new(),
         }
     }
 }
@@ -175,6 +189,8 @@ impl From<UnixStream> for Stream {
             proxy_digest: None,
             socket_digest: None,
             tracer: None,
+            read_pending_time: AccumulatedDuration::new(),
+            write_pending_time: AccumulatedDuration::new(),
         }
     }
 }
@@ -209,6 +225,14 @@ impl GetTimingDigest for Stream {
             established_ts: self.established_ts,
         }));
         digest
+    }
+
+    fn get_read_pending_time(&self) -> Duration {
+        self.read_pending_time.total
+    }
+
+    fn get_write_pending_time(&self) -> Duration {
+        self.write_pending_time.total
     }
 }
 
@@ -272,7 +296,9 @@ impl AsyncRead for Stream {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.stream).poll_read(cx, buf)
+        let result = Pin::new(&mut self.stream).poll_read(cx, buf);
+        self.read_pending_time.poll_time(&result);
+        result
     }
 }
 
@@ -282,15 +308,19 @@ impl AsyncWrite for Stream {
         cx: &mut Context,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
-        if self.buffer_write {
+        let result = if self.buffer_write {
             Pin::new(&mut self.stream).poll_write(cx, buf)
         } else {
             Pin::new(&mut self.stream.get_mut()).poll_write(cx, buf)
-        }
+        };
+        self.write_pending_time.poll_write_time(&result, buf.len());
+        result
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.stream).poll_flush(cx)
+        let result = Pin::new(&mut self.stream).poll_flush(cx);
+        self.write_pending_time.poll_time(&result);
+        result
     }
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<io::Result<()>> {
@@ -302,11 +332,16 @@ impl AsyncWrite for Stream {
         cx: &mut Context<'_>,
         bufs: &[std::io::IoSlice<'_>],
     ) -> Poll<io::Result<usize>> {
-        if self.buffer_write {
+        let total_size = bufs.iter().fold(0, |acc, s| acc + s.len());
+
+        let result = if self.buffer_write {
             Pin::new(&mut self.stream).poll_write_vectored(cx, bufs)
         } else {
             Pin::new(&mut self.stream.get_mut()).poll_write_vectored(cx, bufs)
-        }
+        };
+
+        self.write_pending_time.poll_write_time(&result, total_size);
+        result
     }
 
     fn is_write_vectored(&self) -> bool {
@@ -340,6 +375,12 @@ pub mod async_write_vec {
         buf: &'a mut B,
     }
 
+    #[must_use = "futures do nothing unless you `.await` or poll them"]
+    pub struct WriteVecAll<'a, W, B> {
+        writer: &'a mut W,
+        buf: &'a mut B,
+    }
+
     pub trait AsyncWriteVec {
         fn poll_write_vec<B: Buf>(
             self: Pin<&mut Self>,
@@ -357,6 +398,17 @@ pub mod async_write_vec {
                 buf: src,
             }
         }
+
+        fn write_vec_all<'a, B>(&'a mut self, src: &'a mut B) -> WriteVecAll<'a, Self, B>
+        where
+            Self: Sized,
+            B: Buf,
+        {
+            WriteVecAll {
+                writer: self,
+                buf: src,
+            }
+        }
     }
 
     impl<W, B> Future for WriteVec<'_, W, B>
@@ -369,6 +421,25 @@ pub mod async_write_vec {
         fn poll(mut self: Pin<&mut Self>, ctx: &mut Context<'_>) -> Poll<io::Result<usize>> {
             let me = &mut *self;
             Pin::new(&mut *me.writer).poll_write_vec(ctx, me.buf)
+        }
+    }
+
+    impl<W, B> Future for WriteVecAll<'_, W, B>
+    where
+        W: AsyncWriteVec + Unpin,
+        B: Buf,
+    {
+        type Output = io::Result<()>;
+
+        fn poll(mut self: Pin<&mut Self>, ctx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            let me = &mut *self;
+            while me.buf.has_remaining() {
+                let n = ready!(Pin::new(&mut *me.writer).poll_write_vec(ctx, me.buf))?;
+                if n == 0 {
+                    return Poll::Ready(Err(io::ErrorKind::WriteZero.into()));
+                }
+            }
+            Poll::Ready(Ok(()))
         }
     }
 
@@ -404,3 +475,55 @@ pub mod async_write_vec {
 }
 
 pub use async_write_vec::AsyncWriteVec;
+
+#[derive(Debug)]
+struct AccumulatedDuration {
+    total: Duration,
+    last_start: Option<Instant>,
+}
+
+impl AccumulatedDuration {
+    fn new() -> Self {
+        AccumulatedDuration {
+            total: Duration::ZERO,
+            last_start: None,
+        }
+    }
+
+    fn start(&mut self) {
+        if self.last_start.is_none() {
+            self.last_start = Some(Instant::now());
+        }
+    }
+
+    fn stop(&mut self) {
+        if let Some(start) = self.last_start.take() {
+            self.total += start.elapsed();
+        }
+    }
+
+    fn poll_write_time(&mut self, result: &Poll<io::Result<usize>>, buf_size: usize) {
+        match result {
+            Poll::Ready(Ok(n)) => {
+                if *n == buf_size {
+                    self.stop();
+                } else {
+                    // partial write
+                    self.start();
+                }
+            }
+            // Pending: start the timer, Ready(Err()): does not matter
+            _ => self.start(),
+        }
+    }
+
+    fn poll_time(&mut self, result: &Poll<io::Result<()>>) {
+        match result {
+            Poll::Ready(Ok(())) => {
+                self.stop();
+            }
+            // Pending: start the timer, Ready(Err()): does not matter
+            _ => self.start(),
+        }
+    }
+}

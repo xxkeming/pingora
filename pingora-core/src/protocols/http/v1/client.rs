@@ -427,7 +427,16 @@ impl HttpSession {
     }
 
     fn is_connection_keepalive(&self) -> Option<bool> {
-        is_buf_keepalive(self.get_header(header::CONNECTION).map(|v| v.as_bytes()))
+        let request_keepalive = self
+            .request_written
+            .as_ref()
+            .and_then(|req| is_buf_keepalive(req.headers.get(header::CONNECTION)));
+
+        match request_keepalive {
+            // ignore what the server sends if request disables keepalive explicitly
+            Some(false) => Some(false),
+            _ => is_buf_keepalive(self.get_header(header::CONNECTION)),
+        }
     }
 
     /// `Keep-Alive: timeout=5, max=1000` => 5, 1000
@@ -640,6 +649,11 @@ impl HttpSession {
             .socket_digest
             .as_ref()
             .map(|d| d.local_addr())?
+    }
+
+    /// Get the reference of the [Stream] that this HTTP session is operating upon.
+    pub fn stream(&self) -> &Stream {
+        &self.underlying_stream
     }
 }
 

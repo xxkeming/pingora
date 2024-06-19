@@ -14,6 +14,7 @@
 
 use super::*;
 use pingora_cache::{key::HashBinary, CacheKey, CacheMeta, RespCacheable, RespCacheable::*};
+use std::time::Duration;
 
 /// The interface to control the HTTP proxy
 ///
@@ -55,6 +56,43 @@ pub trait ProxyHttp {
         Ok(false)
     }
 
+    /// Handle the incoming request before any downstream module is executed.
+    ///
+    /// This function is similar to [Self::request_filter()] but execute before any other logic
+    /// especially the downstream modules. The main purpose of this function is to provide finer
+    /// grained control of behavior of the modules.
+    ///
+    /// Note that because this function is executed before any module that might provide access
+    /// control or rate limiting, logic should stay in request_filter() if it can in order to be
+    /// protected by said modules.
+    async fn early_request_filter(&self, _session: &mut Session, _ctx: &mut Self::CTX) -> Result<()>
+    where
+        Self::CTX: Send + Sync,
+    {
+        Ok(())
+    }
+
+    /// Handle the incoming request body.
+    ///
+    /// This function will be called every time a piece of request body is received. The `body` is
+    /// **not the entire request body**.
+    ///
+    /// The async nature of this function allows to throttle the upload speed and/or executing
+    /// heavy computation logic such as WAF rules on offloaded threads without blocking the threads
+    /// who process the requests themselves.
+    async fn request_body_filter(
+        &self,
+        _session: &mut Session,
+        _body: &mut Option<Bytes>,
+        _end_of_stream: bool,
+        _ctx: &mut Self::CTX,
+    ) -> Result<()>
+    where
+        Self::CTX: Send + Sync,
+    {
+        Ok(())
+    }
+
     /// This filter decides if the request is cacheable and what cache backend to use
     ///
     /// The caller can interact with `Session.cache` to enable caching.
@@ -87,9 +125,9 @@ pub trait ProxyHttp {
     // flex purge, other filtering, returns whether asset is should be force expired or not
     async fn cache_hit_filter(
         &self,
+        _session: &Session,
         _meta: &CacheMeta,
         _ctx: &mut Self::CTX,
-        _req: &RequestHeader,
     ) -> Result<bool>
     where
         Self::CTX: Send + Sync,
@@ -238,7 +276,7 @@ pub trait ProxyHttp {
         _body: &mut Option<Bytes>,
         _end_of_stream: bool,
         _ctx: &mut Self::CTX,
-    ) -> Result<Option<std::time::Duration>>
+    ) -> Result<Option<Duration>>
     where
         Self::CTX: Send + Sync,
     {

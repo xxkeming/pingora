@@ -25,8 +25,10 @@ use std::os::unix::net::UnixListener as StdUnixListener;
 use std::time::Duration;
 use tokio::net::TcpSocket;
 
+use crate::protocols::l4::ext::set_tcp_fastopen_backlog;
 use crate::protocols::l4::listener::Listener;
 pub use crate::protocols::l4::stream::Stream;
+use crate::protocols::TcpKeepalive;
 use crate::server::ListenFds;
 
 const TCP_LISTENER_MAX_TRY: usize = 30;
@@ -50,13 +52,30 @@ impl AsRef<str> for ServerAddress {
     }
 }
 
-/// TCP socket configuration options.
-#[derive(Clone, Debug)]
+impl ServerAddress {
+    fn tcp_sock_opts(&self) -> Option<&TcpSocketOptions> {
+        match &self {
+            Self::Tcp(_, op) => op.into(),
+            _ => None,
+        }
+    }
+}
+
+/// TCP socket configuration options, this is used for setting options on
+/// listening sockets and accepted connections.
+#[non_exhaustive]
+#[derive(Clone, Debug, Default)]
 pub struct TcpSocketOptions {
     /// IPV6_V6ONLY flag (if true, limit socket to IPv6 communication only).
     /// This is mostly useful when binding to `[::]`, which on most Unix distributions
     /// will bind to both IPv4 and IPv6 addresses by default.
     pub ipv6_only: bool,
+    /// Enable TCP fast open and set the backlog size of it.
+    /// See the [man page](https://man7.org/linux/man-pages/man7/tcp.7.html) for more information.
+    pub tcp_fastopen: Option<usize>,
+    /// Enable TCP keepalive on accepted connections.
+    /// See the [man page](https://man7.org/linux/man-pages/man7/tcp.7.html) for more information.
+    pub tcp_keepalive: Option<TcpKeepalive>,
     // TODO: allow configuring reuseaddr, backlog, etc. from here?
 }
 
@@ -121,10 +140,17 @@ fn apply_tcp_socket_options(sock: &TcpSocket, opt: Option<&TcpSocketOptions>) ->
     let Some(opt) = opt else {
         return Ok(());
     };
-    let socket_ref = socket2::SockRef::from(sock);
-    socket_ref
-        .set_only_v6(opt.ipv6_only)
-        .or_err(BindError, "failed to set IPV6_V6ONLY")
+    if opt.ipv6_only {
+        let socket_ref = socket2::SockRef::from(sock);
+        socket_ref
+            .set_only_v6(opt.ipv6_only)
+            .or_err(BindError, "failed to set IPV6_V6ONLY")?;
+    }
+
+    if let Some(backlog) = opt.tcp_fastopen {
+        set_tcp_fastopen_backlog(sock.as_raw_fd(), backlog)?;
+    }
+    Ok(())
 }
 
 fn from_raw_fd(address: &ServerAddress, fd: i32) -> Result<Listener> {
@@ -245,6 +271,18 @@ impl ListenerEndpoint {
         Ok(())
     }
 
+    fn apply_stream_settings(&self, stream: &mut Stream) -> Result<()> {
+        // settings are applied based on whether the underlying stream supports it
+        stream.set_nodelay()?;
+        let Some(op) = self.listen_addr.tcp_sock_opts() else {
+            return Ok(());
+        };
+        if let Some(ka) = op.tcp_keepalive.as_ref() {
+            stream.set_keepalive(ka)?;
+        }
+        Ok(())
+    }
+
     pub async fn accept(&mut self) -> Result<Stream> {
         let Some(listener) = self.listener.as_mut() else {
             // panic otherwise this thing dead loop
@@ -254,7 +292,7 @@ impl ListenerEndpoint {
             .accept()
             .await
             .or_err(AcceptError, "Fail to accept()")?;
-        stream.set_nodelay()?;
+        self.apply_stream_settings(&mut stream)?;
         Ok(stream)
     }
 }
@@ -279,7 +317,10 @@ mod test {
 
     #[tokio::test]
     async fn test_listen_tcp_ipv6_only() {
-        let sock_opt = Some(TcpSocketOptions { ipv6_only: true });
+        let sock_opt = Some(TcpSocketOptions {
+            ipv6_only: true,
+            ..Default::default()
+        });
         let mut listener = ListenerEndpoint::new(ServerAddress::Tcp("[::]:7101".into(), sock_opt));
         listener.listen(None).await.unwrap();
         tokio::spawn(async move {

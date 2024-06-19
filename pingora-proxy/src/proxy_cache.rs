@@ -116,11 +116,7 @@ impl<SV> HttpProxy<SV> {
                             // (this is a soft purge which tries to revalidate,
                             // vs. hard purge which forces miss)
                             // TODO: allow hard purge
-                            match self
-                                .inner
-                                .cache_hit_filter(&meta, ctx, session.req_header())
-                                .await
-                            {
+                            match self.inner.cache_hit_filter(session, &meta, ctx).await {
                                 Err(e) => {
                                     error!(
                                         "Failed to filter cache hit: {e}, {}",
@@ -315,7 +311,7 @@ impl<SV> HttpProxy<SV> {
                             // write to downstream
                             if let Err(e) = session
                                 .as_mut()
-                                .write_response_body(b)
+                                .write_response_body(b, false)
                                 .await
                                 .map_err(|e| e.into_down())
                             {

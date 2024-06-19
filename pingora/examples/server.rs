@@ -15,13 +15,14 @@
 #[global_allocator]
 static GLOBAL: jemallocator::Jemalloc = jemallocator::Jemalloc;
 
+use pingora::protocols::TcpKeepalive;
 use pingora::server::configuration::Opt;
 use pingora::server::{Server, ShutdownWatch};
 use pingora::services::background::{background_service, BackgroundService};
 use pingora::services::{listening::Service as ListeningService, Service};
 
 use async_trait::async_trait;
-use structopt::StructOpt;
+use clap::Parser;
 use tokio::time::interval;
 
 use std::time::Duration;
@@ -105,7 +106,7 @@ pub fn main() {
 
     print!("{USAGE}");
 
-    let opt = Some(Opt::from_args());
+    let opt = Some(Opt::parse());
     let mut my_server = Server::new(opt).unwrap();
     my_server.bootstrap();
 
@@ -119,7 +120,16 @@ pub fn main() {
         .unwrap();
 
     let mut echo_service_http = service::echo::echo_service_http();
-    echo_service_http.add_tcp("0.0.0.0:6145");
+
+    let mut options = pingora::listeners::TcpSocketOptions::default();
+    options.tcp_fastopen = Some(10);
+    options.tcp_keepalive = Some(TcpKeepalive {
+        idle: Duration::from_secs(60),
+        interval: Duration::from_secs(5),
+        count: 5,
+    });
+
+    echo_service_http.add_tcp_with_settings("0.0.0.0:6145", options);
     echo_service_http.add_uds("/tmp/echo.sock", None);
 
     let dynamic_cert = DynamicCert::new(&cert_path, &key_path);

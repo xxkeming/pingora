@@ -19,11 +19,11 @@
 //! * Number of threads per service
 //! * Error log file path
 
+use clap::Parser;
 use log::{debug, trace};
 use pingora_error::{Error, ErrorType::*, OrErr, Result};
 use serde::{Deserialize, Serialize};
 use std::fs;
-use structopt::StructOpt;
 
 /// The configuration file
 ///
@@ -118,48 +118,56 @@ impl Default for ServerConf {
 /// Command-line options
 ///
 /// Call `Opt::from_args()` to build this object from the process's command line arguments.
-#[derive(StructOpt, Debug)]
-#[structopt(name = "basic")]
+#[derive(Parser, Debug)]
+#[clap(name = "basic", long_about = None)]
 pub struct Opt {
     /// Whether this server should try to upgrade from a running old server
-    ///
-    /// `-u` or `--upgrade` can be used
-    #[structopt(short, long)]
+    #[clap(
+        short,
+        long,
+        help = "This is the base set of command line arguments for a pingora-based service",
+        long_help = None
+    )]
     pub upgrade: bool,
-    /// Whether should run this server in the background
-    ///
-    /// `-d` or `--daemon` can be used
-    #[structopt(short, long)]
+
+    /// Whether this server should run in the background
+    #[clap(short, long)]
     pub daemon: bool,
+
     /// Not actually used. This flag is there so that the server is not upset seeing this flag
     /// passed from `cargo test` sometimes
-    #[structopt(long)]
+    #[clap(long, hidden = true)]
     pub nocapture: bool,
+
     /// Test the configuration and exit
     ///
     /// When this flag is set, calling `server.bootstrap()` will exit the process without errors
     ///
     /// This flag is useful for upgrading service where the user wants to make sure the new
     /// service can start before shutting down the old server process.
-    ///
-    /// `-t` or `--test` can be used
-    #[structopt(short, long)]
+    #[clap(
+        short,
+        long,
+        help = "This flag is useful for upgrading service where the user wants \
+                to make sure the new service can start before shutting down \
+                the old server process.",
+        long_help = None
+    )]
     pub test: bool,
+
     /// The path to the configuration file.
     ///
     /// See [`ServerConf`] for more details of the configuration file.
-    ///
-    /// `-c` or `--conf` can be used
-    #[structopt(short, long)]
+    #[clap(short, long, help = "The path to the configuration file.", long_help = None)]
     pub conf: Option<String>,
 }
 
 /// Create the default instance of Opt based on the current command-line args.
-/// This is equivalent to running `Opt::from_args` but does not require the
-/// caller to have included the `structopt::StructOpt`
+/// This is equivalent to running `Opt::parse` but does not require the
+/// caller to have included the `clap::Parser`
 impl Default for Opt {
     fn default() -> Self {
-        Opt::from_args()
+        Opt::parse()
     }
 }
 

@@ -15,6 +15,10 @@
 //! Defines where to connect to and how to connect to a remote server
 
 use ahash::AHasher;
+use pingora_error::{
+    ErrorType::{InternalError, SocketError},
+    OrErr, Result,
+};
 use std::collections::BTreeMap;
 use std::fmt::{Display, Formatter, Result as FmtResult};
 use std::hash::{Hash, Hasher};
@@ -25,9 +29,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-pub use crate::protocols::l4::ext::TcpKeepalive;
 use crate::protocols::l4::socket::SocketAddr;
 use crate::protocols::ConnFdReusable;
+use crate::protocols::TcpKeepalive;
 use crate::tls::x509::X509;
 use crate::utils::{get_organization_unit, CertKey};
 
@@ -168,6 +172,13 @@ pub trait Peer: Display + Clone {
         self.get_peer_options().and_then(|o| o.tcp_recv_buf)
     }
 
+    /// Whether to enable TCP fast open.
+    fn tcp_fast_open(&self) -> bool {
+        self.get_peer_options()
+            .map(|o| o.tcp_fast_open)
+            .unwrap_or_default()
+    }
+
     fn matches_fd<V: AsRawFd>(&self, fd: V) -> bool {
         self.address().check_fd_match(fd)
     }
@@ -186,11 +197,24 @@ pub struct BasicPeer {
 }
 
 impl BasicPeer {
-    /// Create a new [`BasicPeer`]
+    /// Create a new [`BasicPeer`].
     pub fn new(address: &str) -> Self {
+        let addr = SocketAddr::Inet(address.parse().unwrap()); // TODO: check error
+        Self::new_from_sockaddr(addr)
+    }
+
+    /// Create a new [`BasicPeer`] with the given path to a Unix domain socket.
+    pub fn new_uds<P: AsRef<Path>>(path: P) -> Result<Self> {
+        let addr = SocketAddr::Unix(
+            UnixSocketAddr::from_pathname(path.as_ref())
+                .or_err(InternalError, "while creating BasicPeer")?,
+        );
+        Ok(Self::new_from_sockaddr(addr))
+    }
+
+    fn new_from_sockaddr(sockaddr: SocketAddr) -> Self {
         BasicPeer {
-            _address: SocketAddr::Inet(address.parse().unwrap()), // TODO: check error, add support
-            // for UDS
+            _address: sockaddr,
             sni: "".to_string(), // TODO: add support for SNI
             options: PeerOptions::new(),
         }
@@ -287,6 +311,8 @@ pub struct PeerOptions {
     pub curves: Option<&'static str>,
     // see ssl_use_second_key_share
     pub second_keyshare: bool,
+    // whether to enable TCP fast open
+    pub tcp_fast_open: bool,
     // use Arc because Clone is required but not allowed in trait object
     pub tracer: Option<Tracer>,
 }
@@ -314,6 +340,7 @@ impl PeerOptions {
             extra_proxy_headers: BTreeMap::new(),
             curves: None,
             second_keyshare: true, // default true and noop when not using PQ curves
+            tcp_fast_open: false,
             tracer: None,
         }
     }
@@ -407,9 +434,11 @@ impl HttpPeer {
     }
 
     /// Create a new [`HttpPeer`] with the given path to Unix domain socket and TLS settings.
-    pub fn new_uds(path: &str, tls: bool, sni: String) -> Self {
-        let addr = SocketAddr::Unix(UnixSocketAddr::from_pathname(Path::new(path)).unwrap()); //TODO: handle error
-        Self::new_from_sockaddr(addr, tls, sni)
+    pub fn new_uds(path: &str, tls: bool, sni: String) -> Result<Self> {
+        let addr = SocketAddr::Unix(
+            UnixSocketAddr::from_pathname(Path::new(path)).or_err(SocketError, "invalid path")?,
+        );
+        Ok(Self::new_from_sockaddr(addr, tls, sni))
     }
 
     /// Create a new [`HttpPeer`] that uses a proxy to connect to the upstream IP and port
